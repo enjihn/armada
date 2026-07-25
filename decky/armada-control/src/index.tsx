@@ -12,6 +12,11 @@ import { registerPerformanceHdrQamPatch } from "./lib/performanceHdrQamPatch";
 import { hasHdrControlCapability } from "./lib/hdrCapability";
 import { autoHdrPreferenceState } from "./lib/autoHdrPreferenceCoordinator";
 import {
+  applyControllerGlyphTheme,
+  clearControllerGlyphTheme,
+  normalizeControllerGlyphStyle,
+} from "./lib/controllerGlyphs";
+import {
   configureCompatPolicy,
   handledGameAppids,
   registerDownloadWatcher,
@@ -57,6 +62,17 @@ export default definePlugin(() => {
     }
   };
   void discoverHdrCapability();
+  configPromise
+    .then((config) => {
+      if (cancelled) return;
+      applyControllerGlyphTheme(
+        config.controllerGlyphVariant,
+        normalizeControllerGlyphStyle(
+          config.tweaks?.global?.controllerGlyphStyle,
+        ),
+      );
+    })
+    .catch(() => {});
   const handledRequest = getCompatApplied()
     .then((appids) => ({ appids, loaded: true }))
     .catch(() => ({ appids: [] as string[], loaded: false }));
@@ -86,6 +102,7 @@ export default definePlugin(() => {
       autoHdrPreferenceState.stop();
       unregisterPerformanceHdrQamPatch();
       unregisterDisplayHdrRoutePatch();
+      clearControllerGlyphTheme();
       unregisterDownloadWatcher();
     },
     icon: (

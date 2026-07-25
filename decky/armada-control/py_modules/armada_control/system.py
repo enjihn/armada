@@ -712,6 +712,16 @@ def update_auto_hdr_preferences(
                 ) from rollback_exc
             raise RuntimeError("Could not persist Auto HDR preferences") from exc
         return _auto_hdr_snapshot(updated, active_scope, active_app_id, runtime)
+def controller_glyph_variant():
+    env = device_env()
+    variant = env.get("ARMADA_CONTROLLER_GLYPH_VARIANT", "")
+    if variant:
+        return variant
+    # Keep plugin-only updates compatible with Odin 3 images that predate the
+    # dedicated profile key.
+    if env.get("ARMADA_DEVICE_ID") == "ayn-odin-3":
+        return "AYN Odin 3"
+    return ""
 
 
 def device_env():
