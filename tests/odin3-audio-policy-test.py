@@ -30,6 +30,7 @@ ROUTE_HOOK = (
 SETUP = SYSTEM / "usr/libexec/armada/odin3-audio-setup"
 DEFAULT = SYSTEM / "usr/libexec/armada/odin3-audio-default"
 STEAM_RESTORE = SYSTEM / "usr/libexec/armada/odin3-audio-steam-restore"
+HOTPLUG = SYSTEM / "usr/libexec/armada/odin3-audio-hotplug"
 LAUNCH_STEAM = SYSTEM / "usr/libexec/armada/launch-steam"
 SETUP_UNIT = (
     SYSTEM / "usr/lib/systemd/system/armada-odin3-audio-setup.service"
@@ -39,6 +40,9 @@ DEFAULT_UNIT = (
 )
 STEAM_RESTORE_UNIT = (
     SYSTEM / "usr/lib/systemd/user/armada-odin3-audio-steam-restore.service"
+)
+HOTPLUG_UNIT = (
+    SYSTEM / "usr/lib/systemd/user/armada-odin3-audio-hotplug.service"
 )
 VENDOR_FILES = ROOT / "build_files/40-vendor-system-files.sh"
 
@@ -83,15 +87,17 @@ class ArtifactContractTests(unittest.TestCase):
             SETUP,
             DEFAULT,
             STEAM_RESTORE,
+            HOTPLUG,
             SETUP_UNIT,
             DEFAULT_UNIT,
             STEAM_RESTORE_UNIT,
+            HOTPLUG_UNIT,
         ):
             self.assertTrue(path.is_file(), path.relative_to(ROOT))
 
     @unittest.skipUnless(os.name != "nt", "POSIX executable modes are not exposed on Windows")
     def test_installed_helpers_are_executable(self) -> None:
-        for path in (SETUP, DEFAULT, STEAM_RESTORE):
+        for path in (SETUP, DEFAULT, STEAM_RESTORE, HOTPLUG):
             self.assertTrue(
                 path.stat().st_mode & stat.S_IXUSR,
                 f"{path.relative_to(ROOT)} must be executable",
@@ -137,6 +143,18 @@ class ArtifactContractTests(unittest.TestCase):
             "test -f /usr/lib/systemd/user/armada-odin3-audio-steam-restore.service",
             vendor,
         )
+        self.assertIn(
+            "test -x /usr/libexec/armada/odin3-audio-hotplug",
+            vendor,
+        )
+        self.assertIn(
+            "test -f /usr/lib/systemd/user/armada-odin3-audio-hotplug.service",
+            vendor,
+        )
+        self.assertIn(
+            "systemctl --global enable armada-odin3-audio-hotplug.service",
+            vendor,
+        )
 
     def test_managed_link_names_are_complete(self) -> None:
         setup = text(SETUP)
@@ -154,7 +172,9 @@ class ArtifactContractTests(unittest.TestCase):
             "SM8750",
             "pactl",
             "get-default-sink",
-            'EXPECTED_SINK = "Virtual Surround Sound"',
+            '"--format=json", "list", "sinks"',
+            'VIRTUAL_SINK = "Virtual Surround Sound"',
+            'STEREO_SINK = "Stereo"',
             "http://127.0.0.1:8080/json",
             'target.get("title") != "SharedJSContext"',
             'page.hostname == "steamloopback.host"',
@@ -163,19 +183,31 @@ class ArtifactContractTests(unittest.TestCase):
             'websocket_endpoint.path.startswith("/devtools/page/")',
             "SteamClient.System.Audio",
             "audio.GetDevices()",
-            'device.sName === "Virtual Surround Sound"',
+            'device.sName === requested.name',
             "audio.SetDefaultDeviceOverride(id, 1)",
-            "after.overrideOutputDeviceId !== id",
+            "after.overrideOutputDeviceId === id",
+            "after.activeOutputDeviceId === id",
+            "virtualOffset",
+            "stereoOffset",
+            "SELECT_EXPRESSION",
+            'SELECT_EXPRESSION.replace("__SELECTION__", payload)',
+            "ensure_ascii=True",
             '"awaitPromise": True',
         ):
             self.assertIn(token, helper)
         self.assertNotIn("set-default-sink", helper)
+        self.assertNotIn("ClearDefaultDeviceOverride", helper)
+        self.assertNotIn('f"""', helper)
         self.assertRegex(helper, r"WAIT_ATTEMPTS\s*=\s*[1-9]\d*")
         self.assertRegex(helper, r"WEBSOCKET_TIMEOUT\s*=\s*[0-9.]+")
         self.assertLess(
             helper.index("target = find_shared_context()"),
-            helper.index("sink = default_sink()"),
+            helper.index("selection = selected_sink()"),
             "Steam readiness must precede the final default-sink decision",
+        )
+        self.assertRegex(
+            helper,
+            r"return 0 if update_steam_override\(target, selection\) else 1",
         )
 
         self.assertRegex(unit, r"(?m)^Type=oneshot$")
@@ -185,6 +217,8 @@ class ArtifactContractTests(unittest.TestCase):
             unit,
         )
         self.assertRegex(unit, r"(?m)^TimeoutStartSec=\d+s$")
+        self.assertRegex(unit, r"(?m)^Restart=on-failure$")
+        self.assertRegex(unit, r"(?m)^StartLimitBurst=[1-9]\d*$")
         self.assertNotIn("[Install]", unit)
 
         trigger = (
@@ -280,15 +314,61 @@ class AudioGraphPolicyTests(unittest.TestCase):
         stereo = text(PIPEWIRE / "55-odin3-stereo.conf")
         surround = text(PIPEWIRE / "50-hrir-7_1.conf")
         documentation = text(ROOT / "docs/odin3-audio/README.md")
-        self.assertRegex(pulse + stereo, r"channelmix\.normalize\s*=\s*false")
-        self.assertRegex(pulse, r"channelmix\.mix-lfe\s*=\s*true")
-        self.assertIn(
-            "downmix coefficients are session-wide",
-            documentation,
-            "the Pulse-wide downmix scope must remain user-visible",
+        self.assertNotRegex(
+            pulse,
+            r"(?:stream\.rules|channelmix\.)\s*",
+            "the compatibility fragment must not modify external channel mixing",
         )
+        self.assertRegex(pulse, r"stream\.properties\s*=\s*\{\s*\}")
+        self.assertRegex(stereo, r"audio\.channels\s*=\s*8")
+        self.assertRegex(
+            stereo,
+            r"audio\.position\s*=\s*\[\s*FL\s+FR\s+FC\s+LFE\s+RL\s+RR\s+SL\s+SR\s*\]",
+        )
+        self.assertIn("downmix inside its own", documentation)
+        self.assertIn("external sinks retain their own", documentation)
+        expected_links = {
+            "FL": ("downmixL", 1),
+            "FC_L": ("downmixL", 2),
+            "LFE_L": ("downmixL", 3),
+            "RL": ("downmixL", 4),
+            "SL": ("downmixL", 5),
+            "FR": ("downmixR", 1),
+            "FC_R": ("downmixR", 2),
+            "LFE_R": ("downmixR", 3),
+            "RR": ("downmixR", 4),
+            "SR": ("downmixR", 5),
+        }
+        source_positions = {
+            "FC_L": "FC",
+            "LFE_L": "LFE",
+            "FC_R": "FC",
+            "LFE_R": "LFE",
+        }
+        for key, (mixer, port) in expected_links.items():
+            position = source_positions.get(key, key)
+            self.assertRegex(
+                stereo,
+                rf'output\s*=\s*"copy{position}:Out"\s+'
+                rf'input\s*=\s*"{mixer}:In {port}"',
+            )
+        for mixer, expected in (
+            ("downmixL", (1.0, 0.707106781, 0.353553391, 0.707106781, 0.707106781)),
+            ("downmixR", (1.0, 0.707106781, 0.353553391, 0.707106781, 0.707106781)),
+        ):
+            block = re.search(
+                rf"name\s*=\s*{mixer}\s+control\s*=\s*\{{(?P<body>.*?)\}}",
+                stereo,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(block, f"{mixer} is missing")
+            for index, coefficient in enumerate(expected, start=1):
+                self.assertRegex(
+                    block.group("body"),
+                    rf'"Gain {index}"\s*=\s*{re.escape(str(coefficient))}',
+                )
         for position in ("FC", "LFE", "RL", "RR", "SL", "SR"):
-            self.assertRegex(surround, rf"(?<![A-Z]){position}(?![A-Z])")
+            self.assertRegex(stereo + surround, rf"(?<![A-Z]){position}(?![A-Z])")
 
     def test_gain_ratios_and_final_clamps_are_exact(self) -> None:
         graphs = "\n".join(text(path) for path in sorted(PIPEWIRE.glob("*.conf")))

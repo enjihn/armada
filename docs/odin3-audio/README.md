@@ -38,14 +38,47 @@ both profiles quieter or louder.
 Steam keeps a separate output-device override inside its SharedJSContext. On
 each Steam launch, `launch-steam` nonblockingly restarts
 `armada-odin3-audio-steam-restore.service`. If and only if the exact Odin 3 /
-SM8750 device policy matches and PipeWire's current default sink is exactly
-**Virtual Surround Sound**, the bounded helper waits for Steam CEF and restores
-that same output in Steam. It selects only the `SharedJSContext` target served
-for `steamloopback.host` through a loopback WebSocket, verifies Steam exposes
-one exact matching output, applies the override, and reads it back. A missing
+SM8750 device policy matches, the bounded helper waits for Steam CEF and
+synchronizes PipeWire's current default output in Steam. It selects only the
+`SharedJSContext` target served for `steamloopback.host` through a loopback
+WebSocket, verifies Steam exposes one exact matching output, applies the
+override, and reads it back. A missing
 target, ambiguous device, timeout, or protocol error leaves the system audio
-default unchanged and is reported in the user journal. **Stereo** and all
-external/default sinks therefore cause no Steam override mutation.
+default unchanged and is reported in the user journal. For **Stereo**,
+Bluetooth, and wired headphones, the helper selects the exact current
+PipeWire sink in Steam and verifies both Steam's override and active output.
+It first matches the exact sink name; if Steam exposes a different friendly
+name, it derives the live Steam device ID from the independently checked
+**Stereo** and **Virtual Surround Sound** PipeWire/Steam ID offset. Device IDs
+are rediscovered on every run and are never persisted.
+
+## External audio
+
+Bluetooth outputs and the Odin 3's 3.5 mm headphone output are independent of
+both built-in-speaker HRIR graphs. They remain ordinary public PipeWire sinks,
+so Steam lists them alongside **Stereo** and **Virtual Surround Sound** while
+the raw **Built-In Audio** speaker transport remains hidden.
+
+`armada-odin3-audio-hotplug.service` watches the live card and sink topology.
+On its first start after an update, it preserves an existing bounded
+**Stereo** or **Virtual Surround Sound** selection from WirePlumber's
+`default-nodes` state before observing the newly created graph.
+It also detects the exact legacy 2-channel `Stereo` volume pattern in which
+FL/FR retain the user's equal volume but the six newly introduced 7.1 channels
+are zero. Once, it copies that existing raw front volume to all eight channels,
+verifies the result, and records a versioned migration marker. Other volume
+layouts are left unchanged.
+Connecting wired headphones switches the exact Odin card to its headphone
+profile; connecting a positively identified BlueZ output selects that output.
+The newest newly connected external output becomes the PipeWire default,
+already-playing streams are moved to it, and Steam is resynchronized. If
+several external outputs are connected, removing the active one selects the
+most recently created remaining output. Removing the final external output
+restores the user's saved **Stereo** or **Virtual Surround Sound** choice.
+
+The router never applies Odin speaker gain, HRIR convolution, hidden-transport
+policy, or the graph-local Stereo downmix to an external sink. Unknown USB,
+HDMI, and unrelated outputs do not trigger this Bluetooth/headphone policy.
 
 ## Signal level
 
@@ -72,8 +105,12 @@ hard `-1 dBFS` sample ceiling. This is an emergency peak limit, not a loudness
 normalizer or a guarantee that all upstream combinations are free of audible
 compression.
 
-The Stereo profile enables center, surround, and LFE downmixing so those
-channels are retained when an application supplies multichannel audio.
+The Stereo profile accepts 7.1 input and performs its downmix inside its own
+filter graph. Front channels use unity coefficients, center and surround
+channels use `0.707106781`, and LFE uses `0.353553391`. The resulting left and
+right signals then use the existing front HRIR paths. This retains every input
+channel without applying speaker-specific downmix policy to Bluetooth,
+headphone, or other external sinks.
 
 ## Installation lifecycle
 
@@ -98,6 +135,10 @@ are available. Existing audio state suppresses that initialization.
 
 `armada-odin3-audio-steam-restore.service` is launch-triggered and intentionally
 is not enabled. Its bounded one-shot failure cannot prevent Steam from starting.
+
+`armada-odin3-audio-hotplug.service` is globally enabled for user sessions but
+exits without changing audio unless the immutable device policy exactly matches
+an AYN Odin 3 on SM8750.
 
 ## Rollback
 
@@ -149,11 +190,9 @@ does not redistribute user replacements.
 - Perceived localization varies by listener and by the HRIR dataset.
 - The hard sample ceiling protects the final graph output but is not a
   true-peak limiter.
-- The virtual sinks, hidden transport, unity-route enforcement, and gain tuning
-  apply only to the built-in Odin 3 speakers. PipeWire Pulse's multichannel
-  downmix coefficients are session-wide, so they are also used when a
-  multichannel Pulse application is reduced to any external stereo sink.
-  External sink gain, routing, and visibility are otherwise unchanged.
+- The virtual sinks, hidden transport, unity-route enforcement, downmix, and
+  gain tuning apply only to the built-in Odin 3 speakers. Bluetooth, headphone,
+  and other external sinks retain their own PipeWire routing and mixing policy.
 - The packaged MIT KEMAR fallback passed live channel-order and routing
   validation on the Odin 3. Its short anechoic response produced comparatively
   subtle speaker localization, so perceived quality remains profile-dependent.
@@ -174,6 +213,12 @@ ODIN3_AUDIO_DEVICE_TEST=1 bash tests/odin3-audio-device-test.sh
 
 The repository test validates the device gate, managed installation and
 rollback, first-run default policy, Steam rehydration contract, graph structure,
-channel routing, gain ratios, and final sample clamps. The device check verifies
-the two public sinks, the internal hardware route, and an expected persistent
-default selection.
+channel routing, gain ratios, final sample clamps, external-output
+classification, connection ordering, stream migration, and saved-speaker
+restoration. The device check verifies the two speaker-profile sinks, the
+internal hardware route, and an expected persistent default selection.
+
+Physical release validation still requires one Bluetooth output and one 3.5 mm
+headset or speaker. For each, verify that connection adds the device to Steam's
+audio picker and selects it, audio bypasses both HRIR profiles, and disconnection
+restores the prior speaker profile.

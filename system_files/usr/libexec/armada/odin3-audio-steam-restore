@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Restore Steam's output override after its SharedJSContext is ready."""
+"""Synchronize Steam's output override after its SharedJSContext is ready."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 
 import websocket
 
@@ -25,32 +26,65 @@ CEF_TARGETS = os.environ.get(
 WAIT_ATTEMPTS = 240
 WAIT_SECONDS = 0.25
 HTTP_TIMEOUT = 0.5
-WEBSOCKET_TIMEOUT = 3.0
-EXPECTED_SINK = "Virtual Surround Sound"
+WEBSOCKET_TIMEOUT = 6.0
+VIRTUAL_SINK = "Virtual Surround Sound"
+STEREO_SINK = "Stereo"
 TRUSTED_PATH = "/usr/bin:/usr/sbin:/bin:/sbin"
 
-# Keep this expression static: no device or target data is interpolated into it.
-RESTORE_EXPRESSION = r"""
+# The only substituted value is a JSON object produced by json.dumps from
+# bounded PipeWire names and integer object indexes. JSON is valid JavaScript
+# syntax and ensure_ascii=True escapes quotes, controls, and line separators.
+SELECT_EXPRESSION = r"""
 (async () => {
+  const requested = __SELECTION__;
   const audio = SteamClient.System.Audio;
   const before = await audio.GetDevices();
   if (!before || !Array.isArray(before.vecDevices))
     throw new Error("GetDevices returned an invalid response");
-  const matches = before.vecDevices.filter(
-    (device) => device && device.bHasOutput === true &&
-      device.sName === "Virtual Surround Sound"
+  const outputs = before.vecDevices.filter(
+    (device) => device && Number.isInteger(device.id) &&
+      device.currentConfig &&
+      Number.isInteger(device.currentConfig.nChannels) &&
+      device.currentConfig.nChannels > 0
   );
-  if (matches.length !== 1 || !Number.isInteger(matches[0].id))
-    throw new Error("exact Virtual Surround Sound output was not unique");
+  let matches = outputs.filter((device) => device.sName === requested.name);
+  if (matches.length !== 1) {
+    const virtual = outputs.filter(
+      (device) => device.sName === "Virtual Surround Sound"
+    );
+    const stereo = outputs.filter((device) => device.sName === "Stereo");
+    if (virtual.length !== 1 || stereo.length !== 1 ||
+        requested.virtualPulseIndex < 0 || requested.stereoPulseIndex < 0)
+      throw new Error("Steam/PipeWire device calibration was not unique");
+    const virtualOffset = virtual[0].id - requested.virtualPulseIndex;
+    const stereoOffset = stereo[0].id - requested.stereoPulseIndex;
+    if (!Number.isInteger(virtualOffset) || virtualOffset !== stereoOffset)
+      throw new Error("Steam/PipeWire device-id calibration disagreed");
+    const derivedId = requested.pulseIndex + virtualOffset;
+    matches = outputs.filter((device) => device.id === derivedId);
+  }
+  if (matches.length !== 1)
+    throw new Error("requested Steam output was not unique");
   const id = matches[0].id;
   await audio.SetDefaultDeviceOverride(id, 1);
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  const after = await audio.GetDevices();
-  if (!after || after.overrideOutputDeviceId !== id)
-    throw new Error("Steam output override verification failed");
-  return { ok: true, id: id };
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const after = await audio.GetDevices();
+    if (after && after.overrideOutputDeviceId === id &&
+        after.activeOutputDeviceId === id)
+      return { ok: true, id: id, name: requested.name };
+  }
+  throw new Error("Steam output selection verification failed");
 })()
 """.strip()
+
+
+@dataclass(frozen=True)
+class SinkSelection:
+    name: str
+    pulse_index: int
+    virtual_pulse_index: int
+    stereo_pulse_index: int
 
 
 def diagnostic(message: str) -> None:
@@ -97,19 +131,93 @@ def is_odin3() -> bool:
     )
 
 
-def default_sink() -> str | None:
+def run_pactl(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [PACTL, *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+
+def default_sink_name() -> str | None:
     try:
-        result = subprocess.run(
-            [PACTL, "get-default-sink"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
+        result = run_pactl("get-default-sink")
     except (OSError, subprocess.SubprocessError) as error:
         diagnostic(f"default sink query failed; leaving Steam unchanged: {error}")
         return None
-    return result.stdout.rstrip("\r\n")
+    sink = result.stdout.rstrip("\r\n")
+    if not sink or "\n" in sink or "\r" in sink:
+        diagnostic("default sink query returned an invalid name; leaving Steam unchanged")
+        return None
+    return sink
+
+
+def selected_sink() -> SinkSelection | None:
+    for attempt in range(1, 9):
+        before = default_sink_name()
+        if before is None:
+            return None
+        try:
+            result = run_pactl("--format=json", "list", "sinks")
+            sinks = json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            diagnostic(f"sink inventory failed; leaving Steam unchanged: {error}")
+            return None
+        after = default_sink_name()
+        if before != after:
+            if attempt < 8:
+                time.sleep(WAIT_SECONDS)
+                continue
+            diagnostic("default sink did not settle; leaving Steam unchanged")
+            return None
+        if not isinstance(sinks, list):
+            diagnostic("sink inventory was not an array; leaving Steam unchanged")
+            return None
+        by_name: dict[str, list[int]] = {}
+        for sink in sinks:
+            if not isinstance(sink, dict):
+                continue
+            name = sink.get("name")
+            index = sink.get("index")
+            if (
+                isinstance(name, str)
+                and 0 < len(name) <= 512
+                and not any(ord(character) < 32 for character in name)
+                and isinstance(index, int)
+                and 0 <= index < 2**31
+            ):
+                by_name.setdefault(name, []).append(index)
+        matches = by_name.get(before, [])
+        if len(matches) != 1:
+            diagnostic(
+                f"default sink {before!r} was not unique; leaving Steam unchanged"
+            )
+            return None
+        virtual = by_name.get(VIRTUAL_SINK, [])
+        stereo = by_name.get(STEREO_SINK, [])
+        return SinkSelection(
+            name=before,
+            pulse_index=matches[0],
+            virtual_pulse_index=virtual[0] if len(virtual) == 1 else -1,
+            stereo_pulse_index=stereo[0] if len(stereo) == 1 else -1,
+        )
+    return None
+
+
+def selection_expression(selection: SinkSelection) -> str:
+    payload = json.dumps(
+        {
+            "name": selection.name,
+            "pulseIndex": selection.pulse_index,
+            "virtualPulseIndex": selection.virtual_pulse_index,
+            "stereoPulseIndex": selection.stereo_pulse_index,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return SELECT_EXPRESSION.replace("__SELECTION__", payload)
 
 
 def find_shared_context() -> str | None:
@@ -146,12 +254,14 @@ def find_shared_context() -> str | None:
     return None
 
 
-def restore_steam_override(websocket_url: str) -> bool:
+def update_steam_override(
+    websocket_url: str, selection: SinkSelection
+) -> bool:
     request = {
         "id": 1,
         "method": "Runtime.evaluate",
         "params": {
-            "expression": RESTORE_EXPRESSION,
+            "expression": selection_expression(selection),
             "awaitPromise": True,
             "returnByValue": True,
         },
@@ -185,7 +295,16 @@ def restore_steam_override(websocket_url: str) -> bool:
     if not isinstance(value, dict) or value.get("ok") is not True:
         diagnostic(f"CEF expression returned an unexpected result: {value!r}")
         return False
-    diagnostic(f"restored Steam output override to device id {value.get('id')}")
+    if (
+        not isinstance(value.get("id"), int)
+        or value.get("name") != selection.name
+    ):
+        diagnostic(f"CEF selection result was not verified: {value!r}")
+        return False
+    diagnostic(
+        f"synchronized Steam output {selection.name!r} "
+        f"to device id {value['id']}"
+    )
     return True
 
 
@@ -199,12 +318,10 @@ def main() -> int:
     target = find_shared_context()
     if target is None:
         return 1
-    sink = default_sink()
-    if sink != EXPECTED_SINK:
-        if sink is not None:
-            diagnostic(f"default sink is {sink!r}; no Steam override requested")
-        return 0
-    return 0 if restore_steam_override(target) else 1
+    selection = selected_sink()
+    if selection is None:
+        return 1
+    return 0 if update_steam_override(target, selection) else 1
 
 
 if __name__ == "__main__":
