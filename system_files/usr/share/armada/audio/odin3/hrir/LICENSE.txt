@@ -1,0 +1,20 @@
+MIT KEMAR HRTF measurement data
+
+Copyright 1994 MIT Media Laboratory
+
+The MIT Media Laboratory provides this data free with no restrictions on use,
+provided Bill Gardner and Keith Martin are cited when it is used in research
+or commercial applications.
+
+Source terms:
+https://sound.media.mit.edu/resources/KEMAR.html
+https://sound.media.mit.edu/resources/KEMAR/README
+
+Required citation:
+
+Bill Gardner and Keith Martin, "HRTF Measurements of a KEMAR Dummy-Head
+Microphone," MIT Media Lab Perceptual Computing Technical Report #280, 1994.
+
+The included odin3-hrir.wav is a deterministic channel selection and
+interleaving of measurements from the official compact data set. See
+PROVENANCE.md for the exact derivation.

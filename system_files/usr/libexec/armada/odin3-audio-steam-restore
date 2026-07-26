@@ -1,0 +1,211 @@
+#!/usr/bin/python3
+"""Restore Steam's output override after its SharedJSContext is ready."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import websocket
+
+
+DEVICE_ENV = os.environ.get(
+    "ARMADA_AUDIO_DEVICE_ENV", "/usr/libexec/armada/device-env"
+)
+PACTL = os.environ.get("ARMADA_AUDIO_PACTL", "/usr/bin/pactl")
+CEF_TARGETS = os.environ.get(
+    "ARMADA_AUDIO_STEAM_CEF_TARGETS", "http://127.0.0.1:8080/json"
+)
+WAIT_ATTEMPTS = 240
+WAIT_SECONDS = 0.25
+HTTP_TIMEOUT = 0.5
+WEBSOCKET_TIMEOUT = 3.0
+EXPECTED_SINK = "Virtual Surround Sound"
+TRUSTED_PATH = "/usr/bin:/usr/sbin:/bin:/sbin"
+
+# Keep this expression static: no device or target data is interpolated into it.
+RESTORE_EXPRESSION = r"""
+(async () => {
+  const audio = SteamClient.System.Audio;
+  const before = await audio.GetDevices();
+  if (!before || !Array.isArray(before.vecDevices))
+    throw new Error("GetDevices returned an invalid response");
+  const matches = before.vecDevices.filter(
+    (device) => device && device.bHasOutput === true &&
+      device.sName === "Virtual Surround Sound"
+  );
+  if (matches.length !== 1 || !Number.isInteger(matches[0].id))
+    throw new Error("exact Virtual Surround Sound output was not unique");
+  const id = matches[0].id;
+  await audio.SetDefaultDeviceOverride(id, 1);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const after = await audio.GetDevices();
+  if (!after || after.overrideOutputDeviceId !== id)
+    throw new Error("Steam output override verification failed");
+  return { ok: true, id: id };
+})()
+""".strip()
+
+
+def diagnostic(message: str) -> None:
+    print(f"Armada Odin 3 Steam audio restore: {message}", file=sys.stderr)
+
+
+def is_odin3() -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/env",
+                "-i",
+                f"PATH={TRUSTED_PATH}",
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-p",
+                DEVICE_ENV,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        diagnostic(f"immutable device policy could not be read: {error}")
+        return False
+
+    policy: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {
+            "ARMADA_DEVICE_ID",
+            "ARMADA_DEVICE_NAME",
+            "ARMADA_SOC_CLASS",
+        }:
+            policy[key] = value
+
+    return (
+        policy.get("ARMADA_DEVICE_ID") == "ayn-odin-3"
+        and policy.get("ARMADA_SOC_CLASS") == "SM8750"
+        and policy.get("ARMADA_DEVICE_NAME")
+        in {"AYN Odin 3", r"AYN\ Odin\ 3", "'AYN Odin 3'"}
+    )
+
+
+def default_sink() -> str | None:
+    try:
+        result = subprocess.run(
+            [PACTL, "get-default-sink"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        diagnostic(f"default sink query failed; leaving Steam unchanged: {error}")
+        return None
+    return result.stdout.rstrip("\r\n")
+
+
+def find_shared_context() -> str | None:
+    for attempt in range(1, WAIT_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(CEF_TARGETS, timeout=HTTP_TIMEOUT) as response:
+                targets = json.load(response)
+            matches = []
+            for target in targets if isinstance(targets, list) else []:
+                if not isinstance(target, dict) or target.get("title") != "SharedJSContext":
+                    continue
+                page = urllib.parse.urlsplit(str(target.get("url", "")))
+                ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                websocket_endpoint = urllib.parse.urlsplit(ws_url)
+                if (
+                    page.scheme == "https"
+                    and page.hostname == "steamloopback.host"
+                    and websocket_endpoint.scheme == "ws"
+                    and websocket_endpoint.hostname == "127.0.0.1"
+                    and websocket_endpoint.port == 8080
+                    and websocket_endpoint.path.startswith("/devtools/page/")
+                ):
+                    matches.append(ws_url)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                diagnostic("multiple qualifying SharedJSContext targets; refusing")
+                return None
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        if attempt < WAIT_ATTEMPTS:
+            time.sleep(WAIT_SECONDS)
+    diagnostic("timed out waiting for the qualifying Steam SharedJSContext")
+    return None
+
+
+def restore_steam_override(websocket_url: str) -> bool:
+    request = {
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": RESTORE_EXPRESSION,
+            "awaitPromise": True,
+            "returnByValue": True,
+        },
+    }
+    try:
+        connection = websocket.create_connection(
+            websocket_url,
+            timeout=WEBSOCKET_TIMEOUT,
+            origin="http://127.0.0.1:8080",
+        )
+        try:
+            connection.send(json.dumps(request, separators=(",", ":")))
+            while True:
+                response = json.loads(connection.recv())
+                if response.get("id") == 1:
+                    break
+        finally:
+            connection.close()
+    except (OSError, ValueError, websocket.WebSocketException) as error:
+        diagnostic(f"CEF evaluation failed: {error}")
+        return False
+
+    if "error" in response:
+        diagnostic(f"CEF Runtime.evaluate rejected the request: {response['error']!r}")
+        return False
+    evaluation = response.get("result", {})
+    if evaluation.get("exceptionDetails"):
+        diagnostic(f"CEF expression failed: {evaluation['exceptionDetails']!r}")
+        return False
+    value = evaluation.get("result", {}).get("value")
+    if not isinstance(value, dict) or value.get("ok") is not True:
+        diagnostic(f"CEF expression returned an unexpected result: {value!r}")
+        return False
+    diagnostic(f"restored Steam output override to device id {value.get('id')}")
+    return True
+
+
+def main() -> int:
+    if not is_odin3():
+        diagnostic("device gate did not match; leaving Steam unchanged")
+        return 0
+    # Steam and the user audio graph start concurrently. Waiting for the
+    # SharedJSContext first also gives WirePlumber time to restore the saved
+    # default instead of mistaking its brief priority fallback for user intent.
+    target = find_shared_context()
+    if target is None:
+        return 1
+    sink = default_sink()
+    if sink != EXPECTED_SINK:
+        if sink is not None:
+            diagnostic(f"default sink is {sink!r}; no Steam override requested")
+        return 0
+    return 0 if restore_steam_override(target) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

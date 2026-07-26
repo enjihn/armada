@@ -1,0 +1,9 @@
+[Unit]
+Description=Restore Odin 3 virtual-surround selection in Steam
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/armada/odin3-audio-steam-restore
+TimeoutStartSec=75s
